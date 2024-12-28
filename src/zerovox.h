@@ -167,54 +167,25 @@ namespace ZeroVOX
             uint32_t vp_kernel_size;
     };
 
-#if 0
-    class VarianceAdaptor
-    {
-        public:
-
-            VarianceAdaptor(ggml_context &ctx,
-                            int    emb_size,
-                            int    vp_filter_size,
-                            int    vp_kernel_size,
-                            int    ve_n_bins,
-                            int    max_seq_len
-                            );
-            //~VarianceAdaptor();
-
-            struct ggml_tensor * graph(struct ggml_cgraph *gf, ggml_context *ctx, struct ggml_tensor *x,
-                                    struct ggml_tensor *pitch_min, struct ggml_tensor *pitch_range);
-
-            int               ve_n_bins;
-
-        private:
-
-            VariancePredictor duration_predictor;
-            VariancePredictor pitch_predictor;
-            VariancePredictor energy_predictor;
-
-            struct ggml_tensor *pitch_embedding_w;
-            struct ggml_tensor *energy_embedding_w;
-
-            int max_seq_len;
-            int emb_size;
-    };
-#endif
-
     class FS2Encoder
     {
         public:
 
-            FS2Encoder(ggml_context &ctx,
-                           uint32_t      max_n_phonemes,
-                           uint32_t      embed_dim,
-                           uint32_t      punct_embed_dim,
-                           uint32_t      encoder_layer,
-                           uint32_t      encoder_head,
-                           uint32_t      conv_filter_size,
-                           uint32_t      conv_kernel_size[2],
-                           uint32_t      vp_kernel_size,
-                           uint32_t      ve_n_bins,
-                           uint32_t      max_seq_len);
+            FS2Encoder(ggml_context   &ctx_w,
+                       ggml_backend_t  backend,
+                       uint32_t        max_n_phonemes,
+                       uint32_t        embed_dim,
+                       uint32_t        punct_embed_dim,
+                       uint32_t        encoder_layer,
+                       uint32_t        encoder_head,
+                       uint32_t        conv_filter_size,
+                       uint32_t        conv_kernel_size[2],
+                       uint32_t        vp_kernel_size,
+                       uint32_t        ve_n_bins,
+                       uint32_t        max_seq_len);
+            ~FS2Encoder();
+
+            uint32_t eval(const int32_t *src_seq_data, const int32_t *puncts_data, const float *style_embed_data, uint32_t num_phonemes, float *x);
 
         private:
 
@@ -227,17 +198,25 @@ namespace ZeroVOX
             struct ggml_tensor *pitch_embedding_w;
             struct ggml_tensor *energy_embedding_w;
 
-            int                 max_seq_len;
-            int                 ve_n_bins;
+            uint32_t            max_n_phonemes;
+            uint32_t            embed_dim;
+            uint32_t            punct_embed_dim;
+            uint32_t            max_seq_len;
+            uint32_t            ve_n_bins;
 
             // graph
-
             struct ggml_cgraph *gf;
-            struct ggml_tensor *src_seq;
-            struct ggml_tensor *puncts;
-            struct ggml_tensor *style_embed;
-            // struct ggml_tensor *pitch_min;
-            // struct ggml_tensor *pitch_range;
+            ggml_backend_t      backend;
+            ggml_gallocr_t      alloc;
+
+            // inputs
+            struct ggml_tensor *src_seq; 
+            struct ggml_tensor *puncts; 
+            struct ggml_tensor *style_embed; 
+
+            // outputs
+            struct ggml_tensor *features;
+            struct ggml_tensor *log_duration_prediction;
     };
 
     class ZeroVOXModel
@@ -245,6 +224,8 @@ namespace ZeroVOX
         public:
             ZeroVOXModel(const std::string & fname);
             ~ZeroVOXModel();
+
+            void eval(void);
 
         private:
 

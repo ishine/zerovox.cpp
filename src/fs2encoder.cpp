@@ -1,7 +1,9 @@
 #include <cstdio>
 #include <cassert>
 #include <cmath>
+#include <cstring>
 #include <vector>
+#include <stdexcept>
 
 #include "zerovox.h"
 
@@ -465,25 +467,32 @@ namespace ZeroVOX
     }
 
 
-    FS2Encoder::FS2Encoder(ggml_context &ctx_w,
-                           uint32_t      max_n_phonemes,
-                           uint32_t      embed_dim,
-                           uint32_t      punct_embed_dim,
-                           uint32_t      encoder_layer,
-                           uint32_t      encoder_head,
-                           uint32_t      conv_filter_size,
-                           uint32_t      conv_kernel_size[2],
-                           uint32_t      vp_kernel_size,
-                           uint32_t      ve_n_bins,
-                           uint32_t      max_seq_len) :
+    FS2Encoder::FS2Encoder(ggml_context   &ctx_w,
+                           ggml_backend_t backend,
+                           uint32_t       max_n_phonemes,
+                           uint32_t       embed_dim,
+                           uint32_t       punct_embed_dim,
+                           uint32_t       encoder_layer,
+                           uint32_t       encoder_head,
+                           uint32_t       conv_filter_size,
+                           uint32_t       conv_kernel_size[2],
+                           uint32_t       vp_kernel_size,
+                           uint32_t       ve_n_bins,
+                           uint32_t       max_seq_len) :
         encoder(ctx_w, max_n_phonemes, embed_dim, encoder_layer, encoder_head, conv_filter_size, conv_kernel_size, punct_embed_dim),
         duration_predictor(ctx_w, "_pe._var_adapt.duration_predictor", vp_kernel_size),
         pitch_predictor(ctx_w, "_pe._var_adapt.pitch_predictor", vp_kernel_size),
         energy_predictor(ctx_w, "_pe._var_adapt.engy_pred", vp_kernel_size)
     {
-        // this->emb_size         = emb_size;
         this->max_seq_len      = max_seq_len;
         this->ve_n_bins        = ve_n_bins;
+        this->max_n_phonemes   = max_n_phonemes;
+        this->embed_dim        = embed_dim;
+        this->punct_embed_dim  = punct_embed_dim;
+
+        this->backend          = backend;
+
+        alloc              = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
 
         pitch_embedding_w  = checked_get_tensor(&ctx_w, "_pe._var_adapt.pitch_embedding.w");
         energy_embedding_w = checked_get_tensor(&ctx_w, "_pe._var_adapt.energy_embedding.w");
@@ -494,7 +503,7 @@ namespace ZeroVOX
 
         //const auto & hparams = model.hparams;
 
-        // FIXME 
+        // FIXME: size
         static size_t buf_size = ggml_tensor_overhead()*GGML_DEFAULT_GRAPH_SIZE + ggml_graph_overhead();
         static std::vector<uint8_t> buf(buf_size);
 
@@ -515,40 +524,32 @@ namespace ZeroVOX
         gf = ggml_new_graph(ctx);
 
         // x = self.src_word_emb(src_seq) # [16, 126, 128]
-        struct ggml_tensor *src_seq = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, max_n_phonemes); 
+        src_seq = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, max_n_phonemes); 
         ggml_set_name(src_seq, "src_seq");
         ggml_set_input(src_seq);
 
-        struct ggml_tensor *puncts  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, max_n_phonemes); 
+        puncts  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, max_n_phonemes); 
         ggml_set_name(puncts, "puncts");
         ggml_set_input(puncts);
 
-        struct ggml_tensor *style_embed  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, emb_size); 
+        style_embed  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, emb_size); 
         ggml_set_name(style_embed, "style_embed");
         ggml_set_input(style_embed);
 
-        // struct ggml_tensor *pitch_min  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, max_n_phonemes); 
-        // ggml_set_name(pitch_min, "pitch_min");
-        // ggml_set_input(pitch_min);
-
-        // struct ggml_tensor *pitch_range  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, max_n_phonemes); 
-        // ggml_set_name(pitch_range, "pitch_range");
-        // ggml_set_input(pitch_range);
-
         // features = self._encoder(src_seq=phoneme, puncts=puncts, mask=phoneme_mask, return_attns=False)
-        struct ggml_tensor *features = encoder.graph(gf, ctx, src_seq, puncts);
+        features = encoder.graph(gf, ctx, src_seq, puncts);
 
-        // # add GST Tokens (style/speaker) embedding to features
-        // style_embed = style_embed.expand_as(features)
-        style_embed = ggml_repeat(ctx, style_embed, features);
-        // features = features + style_embed
-        features = ggml_add (ctx, features, style_embed);
+        // se = style_embed.expand_as(features)
+        struct ggml_tensor *se = ggml_repeat(ctx, style_embed, features);
+        // features = features + se
+        features = ggml_add (ctx, features, se);
 
         // log_duration_prediction = self.duration_predictor(features, src_mask)
-        struct ggml_tensor *log_duration_prediction = duration_predictor.graph(gf, ctx, features);
+        log_duration_prediction = duration_predictor.graph(gf, ctx, features);
         ggml_set_name(log_duration_prediction, "duration");
         ggml_set_output(log_duration_prediction);
         ggml_build_forward_expand(gf, log_duration_prediction);
+        tensor_dbg (gf, ctx, log_duration_prediction, "dbg");
 
         // pitch_prediction = self.pitch_predictor(features, mask)
         struct ggml_tensor *pitch_prediction = pitch_predictor.graph(gf, ctx, features);
@@ -570,107 +571,84 @@ namespace ZeroVOX
         // features = features + energy_embedding
         features = ggml_add(ctx, features, energy_embedding);
 
-        tensor_dbg (gf, ctx, features, "dbg");
-
-        // duration_rounded = torch.clamp((torch.round(torch.exp(log_duration_prediction) - 1)),min=0,)
-        //struct ggml_tensor *duration_rounded = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, log_duration_prediction->ne[0]);
-        //duration_rounded = ggml_map_custom2_inplace(ctx, duration_rounded, log_duration_prediction, ggml_zv_exp_clamp_to_i32, GGML_N_TASKS_MAX, this);
-
-        // x, mel_len = self.length_regulator(x, duration_rounded, max_len)
-        // x: [11, 528] -> [92, 528],  mel_len = tensor([92], device='cuda:0')
-        //model.hparams.max_seq_len
-        // struct ggml_tensor *x_emb = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, max_seq_len);
-        // x_emb = ggml_map_custom3_inplace(ctx, x_emb, x, duration_rounded, ggml_zv_length_regulator, GGML_N_TASKS_MAX, this);
-
-
-        //return log_duration_prediction; // FIXME
-
-
-
-        // features = model.variance_adaptor->graph(gf, ctx, features, pitch_min, pitch_range);
-
         ggml_set_name(features, "features");
         ggml_set_output(features);
         ggml_build_forward_expand(gf, features);
 
+        if (!ggml_gallocr_alloc_graph(alloc, gf))
+            throw std::runtime_error("ggml_gallocr_alloc_graph() failed");
     }
 
-#if 0
-
-    static void ggml_zv_exp_clamp_to_i32(struct ggml_tensor *dst, const struct ggml_tensor *a, const struct ggml_tensor *src, int ith, int nth, void * userdata)
+    FS2Encoder::~FS2Encoder()
     {
-        GGML_ASSERT(userdata);
-        GGML_ASSERT(ggml_are_same_shape(dst, src));
-        GGML_ASSERT(ggml_is_contiguous(dst));
-        GGML_ASSERT(ggml_is_contiguous(src));
+        if (alloc)
+            ggml_gallocr_free(alloc);
+    }
 
-        VarianceAdaptor *self = (VarianceAdaptor *)userdata;
+    uint32_t FS2Encoder::eval(const int32_t *src_seq_data, const int32_t *puncts_data, const float *style_embed_data, uint32_t num_phonemes, float *x)
+    {
+        int emb_size = embed_dim + punct_embed_dim;
 
-        const float *src_data = ggml_get_data_f32(src);
-        int32_t *dst_data = (int32_t *)ggml_get_data(dst);
+        ggml_backend_tensor_set(src_seq, src_seq_data, 0, max_n_phonemes*sizeof(int32_t));
+        ggml_backend_tensor_set(puncts, puncts_data, 0, max_n_phonemes*sizeof(int32_t));
+        ggml_backend_tensor_set(style_embed, style_embed_data, 0, emb_size*sizeof(float));
 
-        const int ne = (int)ggml_nelements(dst);
-        const int dr = (ne + nth - 1) / nth;
-        const int ie0 = dr * ith;
-        const int ie1 = std::min(ie0 + dr, ne);
+        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
+            throw std::runtime_error("ggml_backend_graph_compute() failed");
 
-        int bin_max = self->ve_n_bins-1;
+        //struct ggml_tensor *x = ggml_graph_get_tensor(gf, "x");
+        //print_tensor("x", x, 6);
 
-        for (int i = ie0; i < ie1; ++i)
+        //struct ggml_tensor *x_punct = ggml_graph_get_tensor(gf, "x_punct");
+        //print_tensor("x_punct", x_punct, 11);
+
+        struct ggml_tensor *dbg = ggml_graph_get_tensor(gf, "dbg");
+        print_tensor("dbg", dbg, 3);
+
+        // length regulator: expand features to final mel seq len
+
+        off_t xoff=0;
+        std::memset(x, 0, max_seq_len*emb_size*sizeof(float));
+
+        GGML_ASSERT(ggml_is_contiguous(features));
+        const float *feat_data = ggml_get_data_f32(features);
+
+        GGML_ASSERT(ggml_is_contiguous(log_duration_prediction));
+        const float *dur_data = ggml_get_data_f32(log_duration_prediction);
+
+        for (uint32_t i=0; i<num_phonemes; i++)
         {
-            float x = src_data[i];
+            int32_t duration_runded = (int32_t) (exp(dur_data[i])-1.0+0.5);
+            if (duration_runded<0)
+                continue;
 
-            // torch.clamp((torch.round(torch.exp(log_duration_prediction) - 1)),min=0,)
-            // torch.clamp(torch.round(prediction*(self._ve_n_bins-1)).long(), min=0, max=self._ve_n_bins-1
-            x = exp(x) -1;
-            int32_t y = (int32_t)(x+0.5);
-            if (y<0) y = 0;
+            //printf("duration #%5d: %d\n", i, duration_runded);
 
-            dst_data[i] = y;
+            // repeat feature duration_runded times
+            for (int32_t r=0; r<duration_runded; r++)
+            {
+                std::memcpy(&x[xoff*emb_size], &feat_data[i*emb_size], emb_size*sizeof(float));
+                xoff += 1;
+                if (xoff >= max_seq_len)
+                    break;
+            }
+            if (xoff >= max_seq_len)
+                break;
         }
-    }
 
-    static void ggml_zv_length_regulator(struct ggml_tensor *x_emb, const struct ggml_tensor *a, const struct ggml_tensor *x, const struct ggml_tensor *duration_rounded, int ith, int nth, void * userdata)
-    {
-        GGML_ASSERT(userdata);
-        GGML_ASSERT(ggml_are_same_shape(dst, src));
-        GGML_ASSERT(ggml_is_contiguous(dst));
-        GGML_ASSERT(ggml_is_contiguous(src));
+        // for (off_t xo=0; xo<xoff; xo++)
+        // {
+        //     for (off_t e=0; e<5; e++)
+        //     {
+        //         printf("%g ", x[xo*emb_size+e]);
+        //     }
+        //     printf("\n");
+        // }
 
-        VarianceAdaptor *self = (VarianceAdaptor *)userdata;
+        //printf ("length regulator done. xoff=%ld\n", xoff);
 
-        const float *src_data = ggml_get_data_f32(src);
-        int32_t *dst_data = (int32_t *)ggml_get_data(dst);
-
-        const int ne = (int)ggml_nelements(dst);
-        const int dr = (ne + nth - 1) / nth;
-        const int ie0 = dr * ith;
-        const int ie1 = std::min(ie0 + dr, ne);
-
-        int bin_max = self->ve_n_bins-1;
-
-        for (int i = ie0; i < ie1; ++i)
-        {
-            float x = src_data[i];
-
-            // torch.clamp((torch.round(torch.exp(log_duration_prediction) - 1)),min=0,)
-            // torch.clamp(torch.round(prediction*(self._ve_n_bins-1)).long(), min=0, max=self._ve_n_bins-1
-            x = exp(x) -1;
-            int32_t y = (int32_t)(x+0.5);
-            if (y<0) y = 0;
-
-            dst_data[i] = y;
-        }
-    }
-
-    struct ggml_tensor *VarianceAdaptor::graph(struct ggml_cgraph *gf, ggml_context *ctx, struct ggml_tensor *x,
-                                            struct ggml_tensor *pitch_min, struct ggml_tensor *pitch_range)
-    {
+        return (uint32_t) xoff;
 
     }
-#endif
-
-
-
 
 }
