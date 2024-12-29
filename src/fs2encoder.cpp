@@ -1,3 +1,10 @@
+//
+// FastSpeech 2 Encoder
+//
+// original python code borrowed (under MIT license) from Chung-Ming Chien's implementation of FastSpeech2
+//
+// https://github.com/ming024/FastSpeech2
+
 #include <cstdio>
 #include <cassert>
 #include <cmath>
@@ -549,7 +556,6 @@ namespace ZeroVOX
         ggml_set_name(log_duration_prediction, "duration");
         ggml_set_output(log_duration_prediction);
         ggml_build_forward_expand(gf, log_duration_prediction);
-        tensor_dbg (gf, ctx, log_duration_prediction, "dbg");
 
         // pitch_prediction = self.pitch_predictor(features, mask)
         struct ggml_tensor *pitch_prediction = pitch_predictor.graph(gf, ctx, features);
@@ -601,9 +607,6 @@ namespace ZeroVOX
 
         //struct ggml_tensor *x_punct = ggml_graph_get_tensor(gf, "x_punct");
         //print_tensor("x_punct", x_punct, 11);
-
-        struct ggml_tensor *dbg = ggml_graph_get_tensor(gf, "dbg");
-        print_tensor("dbg", dbg, 3);
 
         // length regulator: expand features to final mel seq len
 

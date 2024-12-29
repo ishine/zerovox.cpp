@@ -47,6 +47,8 @@ namespace ZeroVOX
         GGUF_GET_KEY(ctx_gguf, hparams.encoder_vp_kernel_size   , gguf_get_val_u32 , GGUF_TYPE_UINT32 , true, HPARAM_ENCODER_VP_KERNEL_SIZE);
         GGUF_GET_KEY(ctx_gguf, hparams.encoder_ve_n_bins        , gguf_get_val_u32 , GGUF_TYPE_UINT32 , true, HPARAM_ENCODER_VE_N_BINS);
 
+        GGUF_GET_KEY(ctx_gguf, hparams.audio_num_mels           , gguf_get_val_u32 , GGUF_TYPE_UINT32 , true, HPARAM_AUDIO_NUM_MELS);
+
         // Initialize a backend
         backend = nullptr;
 
@@ -89,6 +91,15 @@ namespace ZeroVOX
                                  hparams.encoder_ve_n_bins,
                                  hparams.max_seq_len);
 
+        uint32_t emb_size = hparams.emb_dim+hparams.punct_emb_dim;
+
+        decoder = new StyleTTSDecoder(*ctx_w,
+                                      backend,
+                                      115, // FIXME hparams.max_seq_len,
+                                      /*dim_in=*/emb_size,
+                                      /*style_dimm=*/emb_size,
+                                      /*residual_dim=*/64,
+                                      hparams.audio_num_mels);
 
         const int n_tensors = gguf_get_n_tensors(ctx_gguf);
 
@@ -303,15 +314,13 @@ namespace ZeroVOX
 
         encoder->eval(src_seq_data, puncts_data, style_embed_data, num_phonemes, x);
 
+        decoder->eval(x, style_embed_data);
 
         //struct ggml_tensor *x = ggml_graph_get_tensor(gf, "x");
         //print_tensor("x", x, 6);
 
         //struct ggml_tensor *x_punct = ggml_graph_get_tensor(gf, "x_punct");
         //print_tensor("x_punct", x_punct, 11);
-
-        // struct ggml_tensor *dbg = ggml_graph_get_tensor(gf, "dbg");
-        // print_tensor("dbg", dbg, 3);
 
         // struct ggml_tensor *dbg2 = ggml_graph_get_tensor(gf, "dbg2");
         // print_tensor("dbg2", dbg2, 11);

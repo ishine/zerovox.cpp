@@ -1,6 +1,7 @@
 
 add_executable(zerovox
                fs2encoder.cpp
+               stylettsdec.cpp
                utils.cpp
                zerovox.cpp)
 target_link_libraries(zerovox PRIVATE ggml)

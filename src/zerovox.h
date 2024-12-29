@@ -28,10 +28,7 @@ namespace ZeroVOX
     #define HPARAM_ENCODER_VP_KERNEL_SIZE   "zerovox-resnet-fs2-styletts.encoder.vp_kernel_size"
     #define HPARAM_ENCODER_VE_N_BINS        "zerovox-resnet-fs2-styletts.encoder.ve_n_bins"
 
-    // #define HPARAM_STATS_ENERGY_MAX         "zerovox-resnet-fs2-styletts.stats.energy_max"
-    // #define HPARAM_STATS_ENERGY_MIN         "zerovox-resnet-fs2-styletts.stats.energy_min"
-    // #define HPARAM_STATS_PITCH_MAX          "zerovox-resnet-fs2-styletts.stats.pitch_max"
-    // #define HPARAM_STATS_PITCH_MIN          "zerovox-resnet-fs2-styletts.stats.pitch_min"
+    #define HPARAM_AUDIO_NUM_MELS           "zerovox-resnet-fs2-styletts.audio.num_mels"
 
     const int NUM_PHONEMES   = 154;
     const int NUM_PUNCTS     =   6;
@@ -52,6 +49,8 @@ namespace ZeroVOX
         uint32_t encoder_vp_filter_size;
         uint32_t encoder_vp_kernel_size;
         uint32_t encoder_ve_n_bins;
+
+        uint32_t audio_num_mels;
     };
 
     class MultiHeadAttention
@@ -219,6 +218,75 @@ namespace ZeroVOX
             struct ggml_tensor *log_duration_prediction;
     };
 
+    class ResBlk1d
+    {
+        public:
+            ResBlk1d(ggml_context  &ctx_w,
+                     int            idx,
+                     uint32_t       dim_in,
+                     uint32_t       dim_out);
+
+            struct ggml_tensor *graph(struct ggml_cgraph *gf, ggml_context *ctx, struct ggml_tensor *x);
+
+        private:
+
+            uint32_t       dim_in;
+            uint32_t       dim_out;
+            bool           learned_sc;
+
+            struct ggml_tensor *conv1_b;
+            // struct ggml_tensor *conv1_w_g;
+            // struct ggml_tensor *conv1_w_v;
+            struct ggml_tensor *conv1_w;
+            // struct ggml_tensor *conv1x1_w_g;
+            // struct ggml_tensor *conv1x1_w_v;
+            struct ggml_tensor *conv1x1_w;
+            struct ggml_tensor *conv2_b;
+            // struct ggml_tensor *conv2_w_g;
+            // struct ggml_tensor *conv2_w_v;
+            struct ggml_tensor *conv2_w;
+            struct ggml_tensor *norm1_b;
+            struct ggml_tensor *norm1_w;
+            struct ggml_tensor *norm2_b;
+            struct ggml_tensor *norm2_w;
+    };
+
+    class StyleTTSDecoder
+    {
+        public:
+
+            StyleTTSDecoder(ggml_context   &ctx_w,
+                            ggml_backend_t  backend,
+                            uint32_t        max_seq_len,
+                            uint32_t        dim_in,
+                            uint32_t        style_dim,
+                            uint32_t        residual_dim,
+                            uint32_t        dim_out);
+            ~StyleTTSDecoder();
+
+            void eval(float *enc_seq_data, float *spk_emb_data);
+
+        private:
+
+            uint32_t        max_seq_len;
+            uint32_t        style_dim;
+            uint32_t        dim_in;
+
+            ResBlk1d encode0, encode1;
+
+            // graph
+            struct ggml_cgraph *gf;
+            ggml_backend_t      backend;
+            ggml_gallocr_t      alloc;
+
+            // inputs
+            struct ggml_tensor *enc_seq; 
+            struct ggml_tensor *spk_emb; 
+
+            // output
+            struct ggml_tensor *x;
+    };
+
     class ZeroVOXModel
     {
         public:
@@ -232,6 +300,7 @@ namespace ZeroVOX
             zerovox_hparams        hparams;
 
             FS2Encoder            *encoder;
+            StyleTTSDecoder       *decoder;
 
             ggml_backend_t         backend;
             ggml_backend_buffer_t  buf_w;

@@ -104,6 +104,9 @@ def main() -> None:
     gguf_writer.add_uint32 (f'{MODELARCH}.decoder.conv_kernel_size.0', cfg['model']['decoder']['conv_kernel_size'][0])
     gguf_writer.add_uint32 (f'{MODELARCH}.decoder.conv_kernel_size.1', cfg['model']['decoder']['conv_kernel_size'][1])
 
+    gguf_writer.add_uint32 (f'{MODELARCH}.audio.num_mels', cfg['audio']['num_mels'])
+
+
     # gguf_writer.add_float32(f'{MODELARCH}.stats.energy_max', cfg['stats']['energy_max'])
     # gguf_writer.add_float32(f'{MODELARCH}.stats.energy_min', cfg['stats']['energy_min'])
     # gguf_writer.add_float32(f'{MODELARCH}.stats.pitch_max', cfg['stats']['pitch_max'])
@@ -127,6 +130,19 @@ def main() -> None:
             tensor = tensor.astype(np.float16);
         if sname.endswith('conv.w'):
             tensor = tensor.astype(np.float16);
+
+        # recompute original weights for torch.nn.utils.weight_norm:
+        if key.endswith('weight_g'):
+            print (f"--> {key} : {tensor}")
+            continue
+        if key.endswith('weight_v'):
+            gname = key.replace('.weight_v', '.weight_g')
+            _g = state_dict[gname].cpu().detach()
+            _v = state_dict[key].cpu().detach()
+            # fixme tensor = _g * (_v / _v.norm(dim=0, keepdim=True))
+            tensor = torch._weight_norm(_v, _g, 0)
+            tensor = tensor.numpy().astype(np.float16)
+            sname = key.replace('weight_v', 'w')
 
         gguf_writer.add_tensor(sname, tensor)
 
