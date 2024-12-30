@@ -251,6 +251,58 @@ namespace ZeroVOX
             struct ggml_tensor *norm2_w;
     };
 
+    class AdaIN1d
+    {
+        public:
+
+            AdaIN1d(ggml_context   &ctx_w,
+                    ggml_backend_t  backend,
+                    int             idx0,
+                    int             idx1,
+                    uint32_t        style_dim,
+                    uint32_t        num_features);
+
+            struct ggml_tensor *graph(struct ggml_cgraph *gf, ggml_context *ctx, struct ggml_tensor *x, struct ggml_tensor *s, struct ggml_tensor *one);
+
+        private:
+            uint32_t            style_dim;
+            uint32_t            num_features;
+
+            struct ggml_tensor *fc_b;
+            struct ggml_tensor *fc_w;
+    };
+
+
+    class AdainResBlk1d
+    {
+        public:
+
+            AdainResBlk1d(ggml_context   &ctx_w,
+                          ggml_backend_t  backend,
+                          int             idx,
+                          uint32_t        dim_in,
+                          uint32_t        dim_out,
+                          uint32_t        style_dim);
+
+            struct ggml_tensor *graph(struct ggml_cgraph *gf, ggml_context *ctx, struct ggml_tensor *x, struct ggml_tensor *s, struct ggml_tensor *one);
+
+        private:
+
+            uint32_t        dim_in;
+            uint32_t        dim_out;
+            uint32_t        style_dim;
+            bool            learned_sc;
+
+            AdaIN1d         norm1;
+            AdaIN1d         norm2;
+
+            struct ggml_tensor *conv1_b;
+            struct ggml_tensor *conv1_w;
+            struct ggml_tensor *conv1x1_w;
+            struct ggml_tensor *conv2_b;
+            struct ggml_tensor *conv2_w;
+    };
+
     class StyleTTSDecoder
     {
         public:
@@ -268,11 +320,18 @@ namespace ZeroVOX
 
         private:
 
-            uint32_t        max_seq_len;
-            uint32_t        style_dim;
-            uint32_t        dim_in;
+            uint32_t            max_seq_len;
+            uint32_t            style_dim;
+            uint32_t            dim_in;
 
-            ResBlk1d encode0, encode1;
+            ResBlk1d            encode0, encode1;
+
+            struct ggml_tensor *asr_res_0_b;
+            struct ggml_tensor *asr_res_0_w;
+            struct ggml_tensor *asr_res_1_b;
+            struct ggml_tensor *asr_res_1_w;
+
+            AdainResBlk1d       decode0;
 
             // graph
             struct ggml_cgraph *gf;
@@ -282,6 +341,7 @@ namespace ZeroVOX
             // inputs
             struct ggml_tensor *enc_seq; 
             struct ggml_tensor *spk_emb; 
+            struct ggml_tensor *one; 
 
             // output
             struct ggml_tensor *x;
