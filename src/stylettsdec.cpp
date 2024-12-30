@@ -102,12 +102,14 @@ namespace ZeroVOX
     struct ggml_tensor *ResBlk1d::graph([[maybe_unused]] struct ggml_cgraph *gf, [[maybe_unused]] ggml_context *ctx, struct ggml_tensor *x)
     {
         //x = self._shortcut(x) + self._residual(x)
+
+        x = ggml_cont(ctx, x);
+
         struct ggml_tensor *y = x;
-        tensor_dbg (gf, ctx, y, "enc_seq");
 
         if (learned_sc)
         {
-            y = ggml_cont(ctx, ggml_transpose(ctx, y));
+            //y = ggml_cont(ctx, ggml_transpose(ctx, y));
             struct ggml_tensor *kernel = conv1x1_w; //  ggml_cont(ctx, ggml_transpose(ctx, conv1x1_w));
             y = ggml_conv_1d(ctx,
                              kernel,   // convolution kernel
@@ -121,7 +123,7 @@ namespace ZeroVOX
 
         // self.norm1 = nn.InstanceNorm1d(dim_in, affine=True)
         // x = self.norm1(x)
-        x = ggml_cont(ctx, ggml_transpose(ctx, x));
+        //x = ggml_cont(ctx, ggml_transpose(ctx, x));
         x = ggml_norm(ctx, x, 1e-5);
         x = ggml_cont(ctx, ggml_transpose(ctx, x));
         //x = ggml_mul(ctx, norm1_w, x);
@@ -175,7 +177,6 @@ namespace ZeroVOX
 
         //return x / math.sqrt(2)  # unit variance
         y = ggml_scale_inplace(ctx, y, 1.0/sqrt(2.0));
-        tensor_dbg (gf, ctx, y, "dbg");
 
         return y;
     }
@@ -225,7 +226,7 @@ namespace ZeroVOX
 
         gf = ggml_new_graph(ctx);
 
-        // x = self.src_word_emb(src_seq) # [16, 126, 128]
+        // x = self.src_word_emb(src_seq) # [115, 528]
         enc_seq = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim_in, max_seq_len); 
         ggml_set_name(enc_seq, "enc_seq");
         ggml_set_input(enc_seq);
@@ -234,12 +235,15 @@ namespace ZeroVOX
         ggml_set_name(spk_emb, "spk_emb");
         ggml_set_input(spk_emb);
 
-        // FIXME
-        // enc_seq = enc_seq.transpose(1,2)
-        // spk_emb = spk_emb.squeeze(1)
+        enc_seq = ggml_transpose(ctx, enc_seq); // [528, 115]
 
         x = encode0.graph(gf, ctx, enc_seq);
-        //x = encode1.graph(gf, ctx, x);
+        x = encode1.graph(gf, ctx, x);
+        tensor_dbg (gf, ctx, x, "dbg");
+
+        // FIXME
+        // spk_emb = spk_emb.squeeze(1)
+        // ...
 
         ggml_set_name(x, "x");
         ggml_set_output(x);
@@ -265,8 +269,5 @@ namespace ZeroVOX
 
         struct ggml_tensor *dbg = ggml_graph_get_tensor(gf, "dbg");
         print_tensor("dbg", dbg, 3);
-
-        dbg = ggml_graph_get_tensor(gf, "enc_seq");
-        print_tensor("enc_seq", dbg, 3);
     }
 }
