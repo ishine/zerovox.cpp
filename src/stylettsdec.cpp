@@ -292,12 +292,13 @@ namespace ZeroVOX
                               1,            // stride
                               0,            // padding
                               1);           // dilation
-            out = ggml_add_inplace(ctx, sc, out);
+            out = ggml_add_inplace(ctx, out, sc);
+        }
+        else
+        {
+            out = ggml_add_inplace(ctx, out, x);
         }
         out = ggml_scale_inplace(ctx, out, 1/sqrt(2.0));
-
-        tensor_dbg (gf, ctx, out, "dbg");
-
 
         return out;
     }
@@ -311,7 +312,11 @@ namespace ZeroVOX
                                      [[maybe_unused]]uint32_t        dim_out) :
         encode0(ctx_w, 0, dim_in, dim_in*2),
         encode1(ctx_w, 1, dim_in*2, dim_in*2),
-        decode0(ctx_w, backend, 0, dim_in * 2 + residual_dim, dim_in*2, style_dim)
+        decode0(ctx_w, backend, 0, dim_in * 2 + residual_dim, dim_in*2, style_dim),
+        decode1(ctx_w, backend, 1, dim_in * 2 + residual_dim, dim_in*2, style_dim),
+        decode2(ctx_w, backend, 2, dim_in * 2 + residual_dim, dim_in, style_dim),
+        decode3(ctx_w, backend, 3, dim_in, dim_in, style_dim),
+        decode4(ctx_w, backend, 4, dim_in, dim_in, style_dim)
     {
         this->max_seq_len = max_seq_len;
         this->style_dim   = style_dim;
@@ -330,11 +335,10 @@ namespace ZeroVOX
         asr_res_1_b  = checked_get_tensor(&ctx_w, "_mel_decoder.asr_res.1.b");
         asr_res_1_w  = checked_get_tensor(&ctx_w, "_mel_decoder.asr_res.1.w");
 
+        to_out_0_b   = checked_get_tensor(&ctx_w, "_mel_decoder.to_out.0.b");
+        to_out_0_w   = checked_get_tensor(&ctx_w, "_mel_decoder.to_out.0.w");
+
         // build graph
-
-        //struct ggml_cgraph * zerovox_graph(const zerovox_model & model, int max_n_phonemes) {
-
-        //const auto & hparams = model.hparams;
 
         // FIXME: size
         static size_t buf_size = ggml_tensor_overhead()*GGML_DEFAULT_GRAPH_SIZE + ggml_graph_overhead();
@@ -398,46 +402,44 @@ namespace ZeroVOX
         struct ggml_tensor *x_cat_hi = ggml_view_2d(ctx, x_cat, max_seq_len, asr_res->ne[1], x_cat->nb[1], x->nb[2]);
         ggml_build_forward_expand(gf, ggml_cpy(ctx, asr_res, x_cat_hi));
 
-        // struct ggml_tensor *ones = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, gamma->ne[0]);
-        // float one = 1.0;
-        // for (int64_t i = 0; i < ones->ne[0]; ++i) 
-        //     ggml_backend_tensor_set(ones, &one, sizeof(float)*i, sizeof(float));
-
-
-
         // self.decode.append(AdainResBlk1d(self.bottleneck_dim + residual_dim, self.bottleneck_dim, style_dim))
         // x = block(x, spk_emb)
         x = decode0.graph(gf, ctx, x_cat, spk_emb, one);
 
-
+        // x = torch.cat([x, asr_res], axis=1)
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, x, x_cat_lo));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, asr_res, x_cat_hi));
 
         // self.decode.append(AdainResBlk1d(self.bottleneck_dim + residual_dim, self.bottleneck_dim, style_dim))
+        x = decode1.graph(gf, ctx, x_cat, spk_emb, one);
+
+        // x = torch.cat([x, asr_res], axis=1)
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, x, x_cat_lo));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, asr_res, x_cat_hi));
+
         // self.decode.append(AdainResBlk1d(self.bottleneck_dim + residual_dim, dim_in, style_dim, upsample=True))
+        x = decode2.graph(gf, ctx, x_cat, spk_emb, one);
+
+        tensor_dbg (gf, ctx, x, "dbg");
+
         // self.decode.append(AdainResBlk1d(dim_in, dim_in, style_dim))
+        x = decode3.graph(gf, ctx, x, spk_emb, one);
+
         // self.decode.append(AdainResBlk1d(dim_in, dim_in, style_dim))
+        x = decode4.graph(gf, ctx, x, spk_emb, one);
 
-
-
-
-        //bool res = true;
-
-
-
-
-        // for block in self.decode:
-        //     if res:
-        //         x = torch.cat([x, asr_res], axis=1)
-
-
-
-
-        //     x = block(x, spk_emb)
-        //     if block.upsample_type != "none":
-        //         res = False
-                
+        // self.to_out = nn.Sequential(weight_norm(nn.Conv1d(dim_in, dim_out, 1, 1, 0)))
         // x = self.to_out(x)
-
-
+        x = ggml_conv_1d(ctx,
+                         to_out_0_w,  // convolution kernel
+                         x,           // data
+                         1,           // stride
+                         0,           // padding
+                         1);          // dilation
+        x = ggml_cont(ctx, ggml_transpose(ctx, x));
+        x = ggml_add (ctx, x, ggml_repeat(ctx, to_out_0_b, x));
+        //x = ggml_cont(ctx, ggml_transpose(ctx, x));
+        x = ggml_cont(ctx, x);
 
         ggml_set_name(x, "x");
         ggml_set_output(x);

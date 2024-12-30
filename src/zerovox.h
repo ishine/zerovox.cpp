@@ -332,6 +332,13 @@ namespace ZeroVOX
             struct ggml_tensor *asr_res_1_w;
 
             AdainResBlk1d       decode0;
+            AdainResBlk1d       decode1;
+            AdainResBlk1d       decode2;
+            AdainResBlk1d       decode3;
+            AdainResBlk1d       decode4;
+
+            struct ggml_tensor *to_out_0_b;
+            struct ggml_tensor *to_out_0_w;
 
             // graph
             struct ggml_cgraph *gf;
