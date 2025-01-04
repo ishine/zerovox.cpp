@@ -2,16 +2,20 @@
 
 import glob
 import os
+import re
 from pathlib import Path
 
 import numpy as np
 import torch
 import yaml
+import h5py
 
 from gguf import GGUFWriter
 
-MODELPATH = Path('/home/guenter/projects/hal9000/ennis/zerovox/models/tts_de_zerovox_mini_1')
+# MODELPATH = Path('/home/guenter/projects/hal9000/ennis/zerovox/models/tts_de_zerovox_mini_1')
+MODELPATH = Path('/home/guenter/projects/hal9000/ennis/zerovox/models/tts_en_de_zerovox_medium_2_styledec')
 MODELARCH = 'zerovox-resnet-fs2-styletts'
+HIFIGAN_PATH = Path('/home/guenter/projects/hal9000/ennis/zerovox/models/meldec-libritts-hifigan-v1')
 
 OUT_MODEL_FN = "medium-ldec.gguf"
 
@@ -59,6 +63,19 @@ def get_sinusoid_encoding_table(n_position, d_hid, padding_idx=None):
 
 def main() -> None:
 
+    # load HifiGAN
+
+    print (f"loading HifiGAN stats from {HIFIGAN_PATH / 'stats.h5'} ...")
+    hifigan_stats = {}
+    with h5py.File(HIFIGAN_PATH / 'stats.h5', 'r') as f:
+        #print (f"h5 keys: {f.keys()}")
+        hifigan_stats = {'mean': f['mean'][:], 'scale': f['scale'][:]}
+        #print (f"stats: {hifigan_stats}")
+
+    print (f"loading HifiGAN checkpoint data from {HIFIGAN_PATH / 'checkpoint.pkl'} ...")
+    hifigan = torch.load(HIFIGAN_PATH / 'checkpoint.pkl', weights_only=False)
+    print (hifigan.keys())
+
     # load model config
 
     config_path = Path(MODELPATH / 'modelcfg.yaml')
@@ -75,6 +92,19 @@ def main() -> None:
     checkpoint = torch.load(ckpt_path, weights_only=False)
 
     state_dict = checkpoint['state_dict']
+
+    # replace _meldec.*
+
+    for key in list(checkpoint['state_dict']):
+        if key.startswith('_meldec.'):
+            print (f"removing {key}")
+            del checkpoint['state_dict'][key]
+
+    meldec_weights = hifigan['model']['generator']
+    for key in meldec_weights:
+        mdeckey = '_meldec.'+key
+        print (f"adding meldec key {mdeckey}")
+        checkpoint['state_dict'][mdeckey] = meldec_weights[key]
 
     keys = list(state_dict.keys())
 
@@ -104,13 +134,12 @@ def main() -> None:
     gguf_writer.add_uint32 (f'{MODELARCH}.decoder.conv_kernel_size.0', cfg['model']['decoder']['conv_kernel_size'][0])
     gguf_writer.add_uint32 (f'{MODELARCH}.decoder.conv_kernel_size.1', cfg['model']['decoder']['conv_kernel_size'][1])
 
+    gguf_writer.add_uint32 (f'{MODELARCH}.audio.sampling_rate', cfg['audio']['sampling_rate'])
     gguf_writer.add_uint32 (f'{MODELARCH}.audio.num_mels', cfg['audio']['num_mels'])
+    gguf_writer.add_uint32 (f'{MODELARCH}.audio.hop_size', cfg['audio']['hop_size'])
 
-
-    # gguf_writer.add_float32(f'{MODELARCH}.stats.energy_max', cfg['stats']['energy_max'])
-    # gguf_writer.add_float32(f'{MODELARCH}.stats.energy_min', cfg['stats']['energy_min'])
-    # gguf_writer.add_float32(f'{MODELARCH}.stats.pitch_max', cfg['stats']['pitch_max'])
-    # gguf_writer.add_float32(f'{MODELARCH}.stats.pitch_min', cfg['stats']['pitch_min'])
+    gguf_writer.add_tensor(f'hifigan.mean', hifigan_stats['mean'])
+    gguf_writer.add_tensor(f'hifigan.scale', hifigan_stats['scale'])
 
     for key in sorted(keys):
         sname = shorten_tensor_name(key)
@@ -133,7 +162,7 @@ def main() -> None:
 
         # recompute original weights for torch.nn.utils.weight_norm:
         if key.endswith('weight_g'):
-            print (f"--> {key} : {tensor}")
+            #print (f"--> {key} : {tensor}")
             continue
         if key.endswith('weight_v'):
             gname = key.replace('.weight_v', '.weight_g')
@@ -141,8 +170,14 @@ def main() -> None:
             _v = state_dict[key].cpu().detach()
             # fixme tensor = _g * (_v / _v.norm(dim=0, keepdim=True))
             tensor = torch._weight_norm(_v, _g, 0)
-            tensor = tensor.numpy().astype(np.float16)
             sname = key.replace('weight_v', 'w')
+
+            # flip weight for deconvolutional layers
+            if re.match(r'^_meldec.upsamples.[0-9].1.w$', sname):
+                tensor = torch.flip(tensor, [2])  # Flip along the kernel dimension
+                tensor = tensor.permute(1, 0, 2)  # Swap in_channels and out_channels
+
+            tensor = tensor.numpy().astype(np.float16)
 
         gguf_writer.add_tensor(sname, tensor)
 

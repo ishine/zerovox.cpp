@@ -309,7 +309,7 @@ namespace ZeroVOX
                                      uint32_t        dim_in,
                                      uint32_t        style_dim,
                                      uint32_t        residual_dim,
-                                     [[maybe_unused]]uint32_t        dim_out) :
+                                     uint32_t        dim_out) :
         encode0(ctx_w, 0, dim_in, dim_in*2),
         encode1(ctx_w, 1, dim_in*2, dim_in*2),
         decode0(ctx_w, backend, 0, dim_in * 2 + residual_dim, dim_in*2, style_dim),
@@ -321,6 +321,7 @@ namespace ZeroVOX
         this->max_seq_len = max_seq_len;
         this->style_dim   = style_dim;
         this->dim_in      = dim_in;
+        this->dim_out     = dim_out;
 
         //uint32_t bottleneck_dim = dim_in * 2;
         //        self.encode = nn.Sequential(ResBlk1d(dim_in, self.bottleneck_dim, normalize=True),
@@ -420,8 +421,6 @@ namespace ZeroVOX
         // self.decode.append(AdainResBlk1d(self.bottleneck_dim + residual_dim, dim_in, style_dim, upsample=True))
         x = decode2.graph(gf, ctx, x_cat, spk_emb, one);
 
-        tensor_dbg (gf, ctx, x, "dbg");
-
         // self.decode.append(AdainResBlk1d(dim_in, dim_in, style_dim))
         x = decode3.graph(gf, ctx, x, spk_emb, one);
 
@@ -455,7 +454,7 @@ namespace ZeroVOX
             ggml_gallocr_free(alloc);
     }
 
-    void StyleTTSDecoder::eval(float *enc_seq_data, [[maybe_unused]]float *spk_emb_data)
+    void StyleTTSDecoder::eval(const float *enc_seq_data, const float *spk_emb_data, float *mel)
     {
         ggml_backend_tensor_set(enc_seq, enc_seq_data, 0, max_seq_len*dim_in*sizeof(float));
         ggml_backend_tensor_set(spk_emb, spk_emb_data, 0, style_dim*sizeof(float));
@@ -466,12 +465,7 @@ namespace ZeroVOX
         if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
             throw std::runtime_error("ggml_backend_graph_compute() failed");
 
-        struct ggml_tensor *dbg;
-
-        dbg = ggml_graph_get_tensor(gf, "dbg");
-        print_tensor("dbg", dbg, 3);
-
-        dbg = ggml_graph_get_tensor(gf, "x");
-        print_tensor("x", dbg, 3);
+        const float *x_data = ggml_get_data_f32(x);
+        memcpy(mel, x_data, sizeof(float)*max_seq_len*dim_out);
     }
 }

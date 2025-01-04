@@ -29,10 +29,12 @@ namespace ZeroVOX
     #define HPARAM_ENCODER_VE_N_BINS        "zerovox-resnet-fs2-styletts.encoder.ve_n_bins"
 
     #define HPARAM_AUDIO_NUM_MELS           "zerovox-resnet-fs2-styletts.audio.num_mels"
+    #define HPARAM_AUDIO_HOP_SIZE           "zerovox-resnet-fs2-styletts.audio.hop_size"
+    #define HPARAM_AUDIO_SAMPLING_RATE      "zerovox-resnet-fs2-styletts.audio.sampling_rate"
 
     const int NUM_PHONEMES   = 154;
     const int NUM_PUNCTS     =   6;
-    const int MAX_N_PHONEMES =  11;
+    const int MAX_N_PHONEMES = 120;
 
     struct zerovox_hparams
     {
@@ -50,7 +52,9 @@ namespace ZeroVOX
         uint32_t encoder_vp_kernel_size;
         uint32_t encoder_ve_n_bins;
 
+        uint32_t audio_sampling_rate;
         uint32_t audio_num_mels;
+        uint32_t audio_hop_size;
     };
 
     class MultiHeadAttention
@@ -316,13 +320,14 @@ namespace ZeroVOX
                             uint32_t        dim_out);
             ~StyleTTSDecoder();
 
-            void eval(float *enc_seq_data, float *spk_emb_data);
+            void eval(const float *enc_seq_data, const float *spk_emb_data, float *mel);
 
         private:
 
             uint32_t            max_seq_len;
             uint32_t            style_dim;
             uint32_t            dim_in;
+            uint32_t            dim_out;
 
             ResBlk1d            encode0, encode1;
 
@@ -354,6 +359,49 @@ namespace ZeroVOX
             struct ggml_tensor *x;
     };
 
+    class HiFiGAN
+    {
+        public:
+
+            HiFiGAN(ggml_context   &ctx_w,
+                    ggml_backend_t  backend,
+                    uint32_t        max_seq_len,
+                    uint32_t        in_channels,
+                    uint32_t        hop_size,
+                    uint32_t        kernel_size,
+                    int             num_upsamples,
+                    const int      *upsample_scales,
+                    int             num_resblocks,
+                    int             num_resblock_dilations,
+                    const int64_t  *resblock_dilations);
+
+            void eval(const float *mel, float *wav);
+
+        private:
+
+            uint32_t            max_seq_len;
+            uint32_t            in_channels;
+            uint32_t            hop_size;
+            int                 num_upsamples;
+            int                 num_resblocks;
+
+            struct ggml_tensor *mean;
+            struct ggml_tensor *scale;
+            struct ggml_tensor *input_conv_b;
+            struct ggml_tensor *input_conv_w;
+            struct ggml_tensor *output_conv_b;
+            struct ggml_tensor *output_conv_w;
+
+            // graph
+            struct ggml_cgraph *gf;
+            ggml_backend_t      backend;
+            ggml_gallocr_t      alloc;
+
+            // inputs
+            struct ggml_tensor *mel; 
+    };
+
+
     class ZeroVOXModel
     {
         public:
@@ -362,12 +410,19 @@ namespace ZeroVOX
 
             void eval(void);
 
+            bool write_wav_file(const std::string &fname);
+
         private:
 
             zerovox_hparams        hparams;
 
             FS2Encoder            *encoder;
             StyleTTSDecoder       *decoder;
+            HiFiGAN               *meldec;
+
+            float                 *hidden_state;
+            float                 *mel;
+            float                 *wav;
 
             ggml_backend_t         backend;
             ggml_backend_buffer_t  buf_w;

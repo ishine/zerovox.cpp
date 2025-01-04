@@ -3,6 +3,10 @@ project("zerovox.cpp" C CXX)
 project("zerovox.cpp" VERSION 0.0.1)
 # include(CheckIncludeFileCXX)
 
+# Find the libsndfile library
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBSNDFILE REQUIRED sndfile)
+
 # set(SOVERSION 1)
 
 #set(CMAKE_WARN_DEPRECATED YES)

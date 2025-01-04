@@ -9,6 +9,8 @@
 #include <cmath>
 #include <cstring>
 
+#include <sndfile.h>
+
 #include "zerovox.h"
 
 const std::string g_gguf_filename = "medium-ldec.gguf";
@@ -18,7 +20,9 @@ namespace ZeroVOX
 
     ZeroVOXModel::ZeroVOXModel(const std::string & fname)
     {
-        encoder = nullptr;
+        encoder      = nullptr;
+        hidden_state = nullptr;
+        mel          = nullptr;
 
         ctx_w = nullptr;
         struct gguf_init_params params = {
@@ -47,7 +51,26 @@ namespace ZeroVOX
         GGUF_GET_KEY(ctx_gguf, hparams.encoder_vp_kernel_size   , gguf_get_val_u32 , GGUF_TYPE_UINT32 , true, HPARAM_ENCODER_VP_KERNEL_SIZE);
         GGUF_GET_KEY(ctx_gguf, hparams.encoder_ve_n_bins        , gguf_get_val_u32 , GGUF_TYPE_UINT32 , true, HPARAM_ENCODER_VE_N_BINS);
 
+        GGUF_GET_KEY(ctx_gguf, hparams.audio_sampling_rate      , gguf_get_val_u32 , GGUF_TYPE_UINT32 , true, HPARAM_AUDIO_SAMPLING_RATE);
         GGUF_GET_KEY(ctx_gguf, hparams.audio_num_mels           , gguf_get_val_u32 , GGUF_TYPE_UINT32 , true, HPARAM_AUDIO_NUM_MELS);
+        GGUF_GET_KEY(ctx_gguf, hparams.audio_hop_size           , gguf_get_val_u32 , GGUF_TYPE_UINT32 , true, HPARAM_AUDIO_HOP_SIZE);
+
+        
+        //hparams.max_seq_len = 116;//FIXME: remove debug code
+
+        // alloc buffers
+
+        hidden_state = (float*) std::malloc(hparams.max_seq_len*(hparams.emb_dim+hparams.punct_emb_dim)*sizeof(float));
+        if (!hidden_state)
+            throw std::runtime_error("hidden_state malloc() failed");
+
+        mel = (float*) std::malloc(hparams.max_seq_len*hparams.audio_num_mels*sizeof(float));
+        if (!mel)
+            throw std::runtime_error("mel malloc() failed");
+
+        wav = (float*) std::malloc(hparams.max_seq_len*hparams.audio_hop_size*sizeof(float));
+        if (!wav)
+            throw std::runtime_error("wav malloc() failed");
 
         // Initialize a backend
         backend = nullptr;
@@ -95,11 +118,24 @@ namespace ZeroVOX
 
         decoder = new StyleTTSDecoder(*ctx_w,
                                       backend,
-                                      115, // FIXME hparams.max_seq_len,
+                                      hparams.max_seq_len,
                                       /*dim_in=*/emb_size,
                                       /*style_dimm=*/emb_size,
                                       /*residual_dim=*/64,
                                       hparams.audio_num_mels);
+
+        const int kernel_size                    = 7;
+        const int num_upsamples                  = 4;
+        int upsample_scales[num_upsamples]       = {5,5,4,3};
+        const int num_resblocks                  = 3;
+        const int num_resblock_dilations         = 3;
+        int64_t resblock_dilations[num_resblocks*num_resblock_dilations] = { 1, 3, 5,
+                                                                             1, 3, 5,
+                                                                             1, 3, 5};
+
+        meldec = new HiFiGAN(*ctx_w, backend, hparams.max_seq_len, hparams.audio_num_mels, hparams.audio_hop_size,
+                             kernel_size,
+                             num_upsamples, upsample_scales, num_resblocks, num_resblock_dilations, resblock_dilations );
 
         const int n_tensors = gguf_get_n_tensors(ctx_gguf);
 
@@ -138,12 +174,22 @@ namespace ZeroVOX
         fclose(f);
 
         gguf_free(ctx_gguf);
+
+
     }
 
     ZeroVOXModel::~ZeroVOXModel()
     {
         if (encoder)
             delete encoder;
+        if (decoder)
+            delete decoder;
+        if (meldec)
+            delete meldec;
+        if (hidden_state)
+            free(hidden_state);
+        if (mel)
+            free(mel);
         ggml_backend_buffer_free(buf_w);
         ggml_backend_free(backend);
         ggml_free(ctx_w);
@@ -151,153 +197,120 @@ namespace ZeroVOX
 
     void ZeroVOXModel::eval(void)
     {
-        // static ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+        int num_phonemes = MAX_N_PHONEMES; // FIXME
 
-        // ggml_cgraph *gf = zerovox_graph(model, MAX_N_PHONEMES);
+        // Der Regenbogen ist ein atmosphärisch-optisches Phänomen, das als kreisbogenförmiges farbiges Lichtband in einem von der Sonne beschienenen Regenschauer erscheint.
 
-        // if (!ggml_gallocr_alloc_graph(alloc, gf))
-        // {
-        //     fprintf(stderr, "%s: ggml_gallocr_alloc_graph() failed\n", __func__);
-        //     return false;
-        // }
-        
-        //std::vector<float> w((NUM_PHONEMES+1)*model.hparams.emb_dim);
-        //ggml_backend_tensor_get(model.src_word_emb_w, w.data(), 0, (NUM_PHONEMES+1)*model.hparams.emb_dim*sizeof(float));
-
-        // struct ggml_tensor *src_seq     = ggml_graph_get_tensor(gf, "src_seq");
-        // struct ggml_tensor *puncts      = ggml_graph_get_tensor(gf, "puncts");
-        // struct ggml_tensor *style_embed = ggml_graph_get_tensor(gf, "style_embed");
-        // // struct ggml_tensor *pitch_min   = ggml_graph_get_tensor(gf, "pitch_min");
-        // // struct ggml_tensor *pitch_range = ggml_graph_get_tensor(gf, "pitch_range");
-        // struct ggml_tensor *y           = ggml_graph_get_tensor(gf, "y");
-
-        int num_phonemes = 11;
-
-        // src_seq = [150, 115,  86,  60,  86,  38, 115,  87,  26,  86,  87]
-        int32_t src_seq_data[MAX_N_PHONEMES] = {150, 115,  86,  60,  86,  38, 115,  87,  26,  86,  87};
-        //ggml_backend_tensor_set(src_seq, src_seq_data, 0, MAX_N_PHONEMES*sizeof(int32_t));
-
-        // puncts = [0, 1, 0, 0, 0, 0, 0, 0, 1, 1, 3]
-        int32_t puncts_data[MAX_N_PHONEMES] = {0, 1, 0, 0, 0, 0, 0, 0, 1, 1, 3};
-        //ggml_backend_tensor_set(puncts, puncts_data, 0, MAX_N_PHONEMES*sizeof(int32_t));
-
-        // float pitch_min_a[MAX_N_PHONEMES];
-        // for (int i=0; i<MAX_N_PHONEMES; i++)
-        //     pitch_min_a[i] = model.hparams.stats_pitch_min;
-        // ggml_backend_tensor_set(pitch_min, &pitch_min_a, 0, MAX_N_PHONEMES*sizeof(float));
-
-        // float pitch_range_a[MAX_N_PHONEMES];
-        // for (int i=0; i<MAX_N_PHONEMES; i++)
-        //     pitch_range_a[i] = model.hparams.stats_pitch_max - model.hparams.stats_pitch_min;
-        // ggml_backend_tensor_set(pitch_range, &pitch_range_a, 0, MAX_N_PHONEMES*sizeof(float));
+        int32_t src_seq_data[MAX_N_PHONEMES] = {69, 26, 102, 117, 5, 73, 109, 81, 68, 83, 73, 109, 81, 60, 86, 87, 35, 81, 123, 87, 80, 105, 86, 72, 27, 117, 115, 118, 54, 84, 87, 115, 118, 109, 86, 72, 110, 81, 83, 80, 5, 81, 69, 0, 86, 34, 79, 86, 78, 117, 1, 86, 68, 83, 73, 109, 81, 72, 100, 102, 80, 115, 73, 109, 86, 72, 0, 102, 68, 115, 73, 109, 86, 79, 30, 97, 87, 68, 64, 81, 87, 60, 81, 35, 81, 109, 80, 72, 21, 81, 69, 26, 102, 95, 21, 81, 109, 68, 109, 118, 7, 81, 109, 81, 109, 81, 117, 5, 73, 109, 81, 118, 66, 102, 145, 102, 118, 1, 81, 87};
+        int32_t puncts_data [MAX_N_PHONEMES] = {0, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 2, 2, 1, 0, 0, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 3};
 
         float style_embed_data[528] = {
-         7.3659e-02,  5.0266e-04, -6.5428e-03, -3.7471e-02, -1.0563e-03,
-         6.9590e-02, -1.0326e-03,  1.7677e-02, -9.3176e-03,  5.8936e-02,
-        -1.0843e-02,  7.9101e-02,  7.6831e-03, -3.2428e-02,  7.5209e-03,
-         2.7240e-02,  5.7505e-02, -2.0784e-02,  2.1862e-02, -6.8526e-03,
-         1.4014e-02,  2.2559e-02,  2.9803e-02, -7.5510e-02,  2.4085e-02,
-        -4.3732e-03,  5.0991e-02, -2.5234e-02,  6.5645e-03, -2.0487e-02,
-        -2.9009e-03,  1.5339e-02, -3.3771e-02, -1.6031e-02,  1.7801e-02,
-        -2.7948e-02, -9.8711e-02,  2.3475e-03,  4.5506e-02, -2.3937e-02,
-         2.6321e-02,  6.1904e-02,  1.2196e-01, -8.8925e-02, -8.5295e-03,
-         7.6742e-03, -1.7869e-02, -3.1901e-02, -6.7269e-02,  1.3832e-03,
-        -1.2114e-03,  3.8728e-02,  4.7201e-02,  2.8416e-02, -4.3200e-02,
-        -4.8024e-02,  4.4020e-02,  2.9262e-02, -1.8148e-02,  3.0653e-02,
-         3.3095e-02,  8.7608e-03, -1.7734e-02,  3.9198e-02,  5.4806e-02,
-         1.0569e-02, -1.7970e-02,  7.6060e-02, -1.0480e-02, -2.1298e-02,
-         1.2409e-02,  8.7465e-03,  1.2928e-02, -6.2916e-02, -9.8409e-03,
-        -2.5053e-02,  1.0192e-02,  5.0692e-02, -4.6819e-02,  3.5347e-02,
-        -3.6800e-03,  3.3029e-02,  3.3573e-02,  1.1007e-02, -1.3887e-02,
-         7.5855e-03, -7.8048e-02, -2.9146e-02,  7.4297e-02, -2.5245e-03,
-         1.1319e-03,  6.1587e-02,  1.2090e-02, -2.6567e-03, -2.8753e-02,
-        -1.6253e-02,  2.4569e-02,  1.8101e-02, -1.0581e-02, -3.0767e-02,
-        -3.8904e-02, -4.1255e-02,  3.8281e-02, -1.9447e-02, -1.7183e-02,
-        -2.6157e-02,  8.6538e-03, -2.2790e-02, -3.8058e-02, -3.0478e-02,
-         1.7347e-02, -6.5259e-02, -5.5485e-02,  2.9537e-02,  4.7108e-02,
-         8.0406e-03, -5.6096e-02,  3.1028e-02, -3.3126e-03, -4.4283e-02,
-        -3.6299e-03,  1.8594e-02,  3.5091e-02,  4.7711e-02,  1.4424e-02,
-         6.3097e-02, -2.9126e-02,  3.2912e-02, -3.0261e-02, -4.1327e-02,
-        -2.9079e-02,  4.2970e-02, -4.9886e-03, -1.6280e-03, -3.1329e-02,
-         2.5877e-02,  8.2097e-03,  2.9592e-02, -2.5918e-02,  4.5382e-02,
-        -7.4126e-03,  1.6643e-02, -1.7109e-02, -3.0812e-02,  1.0357e-01,
-         4.1917e-02,  1.1606e-02,  1.5964e-02,  6.3962e-02,  4.8968e-02,
-         3.6265e-02,  6.6040e-02, -8.2431e-02, -6.2185e-02, -1.0214e-04,
-        -7.0343e-02,  3.4672e-02,  2.2465e-02, -4.2347e-02, -1.2055e-02,
-        -9.3694e-03,  1.9636e-02,  2.1955e-02, -6.7462e-02,  8.7874e-02,
-        -8.1950e-02, -6.4222e-02,  4.8626e-02,  1.6362e-02, -1.4027e-02,
-        -3.9972e-02, -3.7761e-02, -2.6421e-03,  6.1635e-02, -7.3240e-02,
-        -2.5963e-02, -4.2246e-02, -3.6840e-02, -2.2311e-02,  4.7500e-02,
-         3.1948e-02,  1.0754e-02,  3.5694e-02, -1.6924e-02, -3.5907e-02,
-        -4.8971e-02, -4.4917e-02, -2.4257e-02,  4.0181e-02,  6.9334e-03,
-         6.3546e-03, -7.3680e-02,  4.3863e-02, -4.1697e-02, -7.5610e-02,
-         5.6283e-02, -1.5105e-02, -2.0589e-03,  4.9693e-02, -3.4776e-02,
-         1.0781e-02,  6.4383e-02,  3.3948e-02,  1.1891e-02, -5.7819e-02,
-        -2.0503e-02,  4.1314e-02,  4.3428e-02, -5.8559e-02, -6.2019e-02,
-         4.0894e-02,  5.2956e-03,  2.8838e-03,  2.1549e-02,  1.0729e-02,
-         6.2147e-02,  3.4747e-02, -1.0820e-01,  7.4249e-02, -3.0443e-02,
-        -2.2190e-02,  4.1751e-02,  1.1029e-01, -1.4219e-02,  1.1669e-02,
-         4.2097e-02, -2.8579e-02, -2.0263e-02,  5.5132e-03,  8.7324e-03,
-         1.6081e-02,  2.8152e-02, -1.7053e-02, -2.0992e-02, -5.0242e-02,
-        -2.7748e-02,  3.3896e-02,  2.2596e-02,  9.2270e-02, -8.2071e-03,
-         1.0586e-02,  3.8054e-02, -2.4005e-02,  7.6061e-02,  6.3751e-02,
-        -3.3300e-02,  4.9671e-02,  7.0344e-03, -3.7034e-03,  3.2764e-02,
-         4.7955e-02,  4.9348e-02,  2.5320e-02,  1.3136e-02,  1.7242e-02,
-        -2.1625e-02, -7.0697e-02,  1.6638e-03, -3.0637e-02,  6.6399e-02,
-         3.6314e-02, -3.5447e-02,  4.5695e-03,  5.2071e-02,  5.3575e-02,
-         6.1097e-02, -4.7511e-02,  4.3019e-02, -4.2027e-02,  2.2281e-02,
-        -6.1882e-02,  2.5569e-02,  1.0726e-02, -3.8276e-02, -4.1588e-02,
-        -9.9238e-03,  4.2918e-02, -7.7892e-02,  1.4573e-02, -4.0984e-02,
-         7.9660e-02,  2.7177e-02, -9.0981e-04,  6.9981e-03,  1.1556e-02,
-         4.2847e-02, -3.4945e-03,  1.4815e-02,  1.5982e-02, -2.8289e-02,
-        -1.0511e-02,  1.2357e-02,  6.1703e-03, -7.3271e-02,  2.1268e-02,
-        -1.3880e-02, -6.8653e-02,  1.0565e-02, -1.6328e-03, -4.7050e-02,
-         4.8317e-02, -3.0465e-02, -1.9396e-02, -3.9026e-02, -2.0494e-02,
-        -1.7990e-02, -3.2886e-02, -1.2596e-02,  5.7034e-02,  7.7916e-02,
-         1.5011e-02, -4.0524e-02,  6.5738e-02, -6.4497e-02,  7.3282e-02,
-        -9.3706e-03,  2.7256e-02,  4.7374e-02, -4.1460e-02,  3.9556e-02,
-        -3.7284e-02,  2.3300e-02,  2.7274e-02, -5.8233e-03,  3.8058e-02,
-         3.3855e-02,  6.7934e-02,  3.5258e-02, -7.0924e-03, -2.4355e-02,
-        -4.7719e-02,  2.4226e-02, -2.6625e-02,  8.9272e-02, -3.4004e-02,
-        -2.6442e-02,  4.5164e-02,  6.9057e-02, -1.8437e-02,  6.3769e-02,
-         7.7940e-03,  3.6622e-03, -8.0939e-02, -8.7010e-02, -4.8476e-02,
-         2.7678e-02, -1.5762e-02, -5.8475e-02, -6.1275e-02,  1.2637e-02,
-        -5.2410e-02, -1.8670e-02, -1.4053e-01,  5.7134e-02,  7.0297e-02,
-         1.8210e-03,  1.3602e-02,  2.3701e-02,  2.4422e-02, -3.7841e-02,
-         2.4869e-02, -2.2182e-02,  3.9201e-03,  2.9589e-02, -1.3709e-02,
-         3.0735e-02,  5.5844e-02, -3.0001e-02, -4.8189e-02, -1.2909e-02,
-        -2.5347e-02, -2.0596e-02,  1.0211e-01,  3.0619e-02, -1.0197e-01,
-         2.2304e-02, -8.3113e-03,  1.2583e-01,  1.9637e-02, -2.4393e-02,
-         2.2151e-02, -7.5491e-02, -5.1172e-02,  1.1070e-02, -1.1944e-02,
-         7.4198e-02, -3.9359e-02,  2.2818e-02,  3.8035e-02, -4.0181e-02,
-        -1.3766e-02,  2.9062e-02, -1.0164e-02, -9.8718e-02,  2.1204e-02,
-        -2.5231e-02, -4.4410e-02,  3.0807e-02,  6.7081e-02,  6.8380e-03,
-        -1.5150e-02, -3.4259e-02, -1.4193e-02,  9.2370e-02, -2.1744e-02,
-         7.5269e-02, -2.6060e-02, -2.1665e-02,  3.3039e-02, -4.3331e-02,
-         1.7362e-02, -4.0898e-02,  5.2190e-02, -2.1288e-02,  4.2191e-02,
-        -3.2984e-02,  2.4955e-02, -1.7306e-02,  2.7595e-02,  3.0643e-02,
-        -1.7492e-02,  1.4456e-02, -1.2413e-01,  1.4219e-02, -2.6955e-02,
-         6.3441e-02, -1.0650e-01,  4.8868e-02,  5.7556e-03, -6.3269e-03,
-        -3.9281e-02,  8.7581e-02, -3.8899e-02, -5.8725e-02,  9.8057e-03,
-         9.8030e-03, -1.6890e-02, -1.1993e-01,  1.6286e-02, -3.5781e-02,
-         3.1365e-02,  1.8312e-02,  9.2168e-02,  9.3589e-03,  4.5563e-02,
-         3.5109e-02,  5.5509e-02,  6.2787e-02, -6.6396e-02, -8.6968e-02,
-        -6.1091e-03,  5.4935e-02, -1.0500e-02,  9.3638e-03, -4.9057e-02,
-        -2.4767e-02, -3.6407e-03, -1.4540e-02,  7.0527e-02,  1.0632e-02,
-        -4.4427e-02,  5.2730e-02,  4.5080e-03, -5.8011e-02, -5.7675e-02,
-        -1.2262e-02, -4.3363e-02,  1.6011e-02, -6.2183e-03, -5.8607e-02,
-         7.1235e-02,  3.9330e-02, -3.8231e-02, -1.0898e-01,  3.6655e-02,
-        -2.4495e-02, -5.3603e-02, -2.7977e-03, -6.1488e-02,  1.3309e-02,
-        -7.5936e-02, -8.1418e-02,  5.1106e-02, -3.1873e-02,  3.0707e-02,
-         5.2765e-02, -2.2604e-02, -1.1471e-01,  2.8089e-02, -1.6024e-02,
-        -2.1106e-02,  3.4020e-02, -2.3916e-02,  4.3647e-02,  1.0358e-01,
-        -6.0562e-02,  4.1847e-02, -1.6619e-02, -4.5269e-02,  1.3921e-02,
-        -3.8562e-02, -4.8185e-02,  7.0595e-02, -4.1297e-03,  7.8182e-02,
-        -4.7511e-02, -1.3953e-03,  4.3699e-02,  9.5456e-03,  7.5895e-02,
-        -4.8886e-02,  3.4786e-02,  5.2504e-02,  5.1594e-03,  2.7654e-02,
-         6.1631e-03, -6.2448e-03, -2.5518e-02, -1.5373e-02, -2.0481e-02,
-         1.0327e-02,  5.0946e-02, -2.7792e-02, -5.4474e-02,  2.3683e-02,
-         4.6950e-02, -2.2749e-02, -3.4948e-02
+         -3.3215e-02,  3.8201e-02, -5.9022e-02,  1.1678e-02,  3.6475e-02,
+         -2.7423e-02, -6.1589e-04, -5.7507e-02, -8.3661e-02, -7.9317e-02,
+         1.6819e-02,  6.2799e-05, -3.5430e-02,  2.8256e-02,  3.1210e-03,
+         1.0054e-02,  8.5303e-02, -1.0629e-02, -8.0564e-02, -1.4030e-02,
+         6.3730e-02, -8.6354e-03,  4.7948e-02, -1.9710e-02, -2.8996e-02,
+        -6.5679e-02,  2.3563e-02, -9.5020e-03,  7.5294e-02, -4.4114e-02,
+         6.2254e-02, -2.9038e-02,  4.8717e-02,  4.5398e-02, -5.0592e-03,
+         5.8795e-02, -2.6262e-02,  1.8539e-02,  2.6485e-02,  3.8732e-02,
+        -1.5195e-02, -2.4412e-02,  5.4493e-02, -2.6948e-02, -1.3855e-02,
+         4.0775e-02, -3.5305e-02, -8.2256e-02,  2.3287e-02,  1.1727e-02,
+         3.6795e-03, -3.4937e-02, -3.2590e-03,  3.8497e-04, -7.2939e-04,
+        -3.1414e-02,  5.4537e-02,  2.5797e-02, -4.5980e-02, -1.4410e-03,
+         3.8969e-02,  3.2946e-03,  3.1352e-02,  1.4927e-02, -2.4787e-02,
+         3.0365e-02,  5.8112e-02,  4.0310e-02,  5.1757e-02, -9.5479e-03,
+         5.6483e-03, -4.1380e-02, -3.9694e-02,  1.3546e-02, -4.7699e-02,
+        -2.2485e-02, -4.7646e-02, -1.9125e-02, -4.4340e-02,  5.4521e-02,
+        -4.6883e-02, -4.2803e-02, -5.0035e-02,  5.2024e-02, -8.6474e-02,
+         5.6821e-02,  3.0837e-02,  1.9413e-02, -3.2098e-02, -2.3332e-02,
+         3.7121e-02,  2.5287e-02,  9.8179e-03, -1.5703e-02,  3.2516e-02,
+        -4.4404e-02, -1.9952e-02, -8.5996e-03,  4.3328e-03,  5.4122e-02,
+         2.8946e-02, -3.0179e-03,  2.8949e-02, -2.5539e-02, -4.8855e-03,
+        -1.1224e-02, -3.2807e-02,  4.4556e-02,  3.2388e-02, -2.2374e-02,
+         9.1722e-02,  3.6068e-02,  1.7756e-02, -3.1594e-02, -9.2172e-02,
+        -1.0658e-01, -4.1726e-02,  5.8524e-02, -1.9533e-02,  2.1717e-02,
+         3.5877e-02, -4.0133e-02,  3.4485e-02,  7.7395e-02,  2.1210e-02,
+         5.8594e-02, -1.9482e-02, -3.6054e-02, -1.1842e-02, -4.1441e-02,
+         6.7316e-04, -1.1915e-02,  1.3289e-02, -2.2518e-02,  1.7770e-02,
+        -7.8534e-03,  1.1667e-02,  2.9361e-02,  1.7638e-02,  1.1973e-02,
+         1.7526e-02, -4.4542e-02, -3.3217e-02, -2.5015e-02, -5.4413e-02,
+        -1.9724e-02, -2.5991e-03, -5.0686e-02, -2.7104e-02,  4.1738e-02,
+        -2.0600e-02, -7.7754e-02, -1.1024e-02, -3.8237e-02,  4.5542e-02,
+         5.2697e-02,  5.0668e-02, -9.0702e-04,  6.3776e-03, -2.7626e-02,
+         2.8720e-02, -6.4390e-03,  1.3270e-02, -3.6621e-02, -4.2676e-02,
+         1.7160e-02,  6.6821e-04, -9.1236e-03,  7.9707e-02, -3.1427e-02,
+        -9.7707e-02,  3.0654e-02, -2.3645e-02, -6.7404e-02,  5.8089e-02,
+        -1.5079e-02, -5.3696e-03,  1.9862e-01,  7.3243e-02,  7.9739e-02,
+        -5.0053e-02,  3.1905e-05, -1.0611e-01,  3.2571e-02, -3.8418e-02,
+         4.8736e-03,  5.1538e-02,  2.3183e-03,  3.4974e-02, -1.6590e-02,
+         3.5530e-02,  1.9276e-02,  6.6471e-02, -3.4386e-02,  6.7165e-03,
+         3.2527e-02, -8.9185e-03,  1.9203e-02,  2.1367e-02,  2.7984e-02,
+        -2.2409e-02,  6.8348e-02, -1.2399e-03,  2.6317e-02,  6.3847e-02,
+        -3.4924e-03, -2.2350e-02, -9.2317e-03,  4.9535e-02, -2.0052e-02,
+         1.0053e-01,  7.5240e-03,  1.9086e-03,  1.5362e-02, -9.4972e-02,
+         1.6310e-03,  3.5154e-02,  3.4412e-02,  4.0742e-02, -4.3078e-02,
+         3.8023e-02,  7.8372e-03, -7.4794e-03,  5.0684e-02, -5.1240e-02,
+         5.3390e-02, -2.7314e-02,  3.5919e-03,  2.5983e-02, -6.9249e-03,
+        -6.0799e-02,  4.4554e-02, -3.2238e-02,  4.6624e-02, -2.6189e-02,
+         2.3149e-02,  6.9735e-02, -8.9658e-03, -5.4266e-03, -7.9390e-03,
+         1.8791e-02,  9.7308e-03, -1.0107e-02, -3.9234e-02, -3.2387e-03,
+        -7.5655e-03, -1.9982e-02,  4.1388e-02, -5.6373e-02,  3.0449e-02,
+         3.1917e-02, -1.2647e-03, -1.1675e-02, -3.0076e-02,  7.6463e-02,
+        -1.8073e-02, -5.3291e-03, -1.7936e-02, -2.1800e-03,  5.7789e-02,
+        -3.9775e-02,  3.9785e-02, -3.5088e-03,  6.1291e-03,  3.4373e-03,
+         2.2329e-02,  4.7882e-02,  1.9970e-02, -5.9728e-02,  3.1290e-02,
+        -1.5654e-03, -1.3179e-03, -8.5198e-03,  1.8759e-03,  4.7919e-03,
+        -7.5008e-02, -1.5729e-03,  6.3809e-02, -2.1049e-02,  3.2666e-02,
+        -5.2376e-02, -3.1811e-03,  7.8827e-02,  1.5260e-02,  4.1064e-02,
+        -4.4569e-02,  2.8538e-02, -1.3009e-02,  1.9214e-02, -1.4053e-02,
+         3.2405e-02, -2.9060e-02, -3.7925e-02,  2.5997e-02, -4.1312e-02,
+        -1.1945e-02,  1.7964e-02, -7.7487e-02,  1.1780e-02, -3.5243e-02,
+         4.3898e-02, -1.7044e-02,  3.9825e-02,  5.9645e-02, -6.9346e-02,
+        -2.1006e-03,  2.1957e-02, -1.1927e-02,  2.8720e-02,  1.0882e-02,
+        -3.5296e-02,  1.0871e-03,  3.1802e-02,  8.5042e-02,  3.3373e-02,
+        -8.2192e-03, -6.0587e-02,  4.8460e-02,  3.3073e-02, -2.0976e-02,
+         3.1006e-02,  5.0424e-02, -2.6720e-02,  1.7916e-02, -2.1062e-01,
+        -4.6970e-02,  8.7889e-03,  1.2457e-02, -4.0161e-02,  1.0424e-02,
+         3.4485e-02, -3.5720e-02,  2.2036e-02,  1.1039e-02,  3.0930e-02,
+         9.6744e-04,  1.7452e-02, -6.0250e-02, -3.2940e-02,  3.9362e-02,
+         4.8447e-02,  3.2648e-02,  1.8395e-02, -6.9633e-02, -9.9153e-02,
+        -2.8067e-02, -4.6497e-03, -3.5246e-02, -1.1738e-02, -3.4535e-02,
+        -5.7202e-02,  2.4374e-02,  8.9280e-03, -4.1428e-02, -1.9166e-02,
+         1.9527e-02, -4.4860e-02,  4.5595e-02,  3.9441e-02,  6.5347e-02,
+         5.7278e-02,  3.2119e-02, -2.4958e-02, -1.9082e-02, -3.5265e-02,
+         9.5697e-03, -7.5254e-03, -4.3990e-02, -6.4076e-02,  8.1393e-02,
+         7.4648e-03,  9.1873e-02, -1.4765e-02, -1.1455e-02,  3.0522e-02,
+         2.1051e-02,  4.6780e-02,  1.3205e-02, -1.4833e-02, -5.4270e-02,
+         9.8399e-03,  1.7885e-02,  9.3177e-03,  6.5344e-03, -6.9957e-02,
+         1.5476e-02,  9.6923e-02,  9.0533e-03,  6.3101e-02,  2.1883e-02,
+        -5.3379e-02, -2.1589e-02,  5.9184e-02, -1.3627e-02,  7.6371e-02,
+         3.3433e-02, -4.0558e-02,  1.8679e-01,  2.9458e-02, -8.6836e-03,
+        -3.8180e-03,  4.3705e-02,  9.7839e-03,  1.0383e-02,  6.7799e-02,
+        -6.7745e-03, -2.3792e-03,  2.5210e-02,  5.6954e-02, -9.6462e-02,
+        -1.7826e-02, -5.4665e-03,  7.2767e-03, -4.6537e-03,  1.3716e-02,
+         7.3392e-02, -5.2109e-03, -5.1407e-03, -3.5027e-02,  1.1521e-03,
+         2.3709e-03,  3.6950e-02,  5.8684e-03, -4.0941e-02, -6.3830e-02,
+         3.7619e-02,  1.6036e-02,  5.2230e-02,  3.2547e-02,  7.6609e-04,
+         6.2975e-02,  1.9834e-02, -4.9903e-02,  7.0185e-02,  1.4505e-02,
+        -1.0321e-02, -9.5576e-03,  1.1040e-01,  2.6941e-02,  2.8073e-02,
+        -3.9346e-02,  4.4460e-02, -4.5495e-02,  1.5063e-02,  1.1960e-02,
+        -1.7319e-02,  4.8269e-02,  8.1929e-02, -3.4443e-03,  7.9763e-03,
+        -7.1177e-02,  6.6055e-03,  2.3034e-02, -5.1478e-02, -1.4807e-03,
+         5.9008e-02, -1.9507e-02, -2.8964e-02, -7.1374e-02,  4.6614e-02,
+        -4.9382e-02,  1.4291e-02,  3.6436e-02, -1.6752e-02,  1.6439e-02,
+        -2.7916e-02,  3.3630e-02, -5.3471e-02, -2.5925e-02,  9.5559e-02,
+         1.0826e-02, -2.1186e-02, -2.6649e-02,  4.3056e-03,  9.9544e-03,
+        -4.9696e-02,  4.2241e-02,  6.4465e-02, -1.7665e-02, -2.9195e-02,
+         2.5760e-02, -7.6103e-02,  8.7177e-02, -2.2697e-03, -4.3329e-02,
+         6.4015e-03,  2.9885e-03, -3.6598e-02, -1.1688e-02, -3.4011e-02,
+        -4.5343e-03, -9.0722e-03,  2.6475e-03,  1.8297e-02,  5.6105e-02,
+        -4.1172e-02,  1.4369e-02,  7.6279e-03, -8.7920e-03, -6.0066e-02,
+        -1.6982e-02,  1.2943e-02,  6.9036e-02,  2.1832e-02, -4.8196e-03,
+         4.1074e-02, -5.3367e-02, -1.2246e-02, -5.1704e-02, -2.7597e-04,
+         2.8585e-03, -2.1111e-02, -2.4354e-02,  1.7635e-01, -1.2212e-02,
+        -6.5809e-03,  2.1182e-02,  3.5522e-02,  3.8160e-02, -1.4582e-02,
+        -5.0781e-02,  8.8718e-02, -2.7904e-02, -2.7633e-02, -3.6089e-02,
+        -2.1236e-02,  1.8911e-01, -5.5733e-02
         };
 
         //ggml_backend_tensor_set(style_embed, style_embed_data, 0, 528*sizeof(float));
@@ -308,27 +321,77 @@ namespace ZeroVOX
         //     return false;
         // }
 
-        float *x = (float*) std::malloc(hparams.max_seq_len*(hparams.emb_dim+hparams.punct_emb_dim)*sizeof(float));
-        if (!x)
-            throw std::runtime_error("x malloc() failed");
+        // run FastSpeech2 encoder
 
-        encoder->eval(src_seq_data, puncts_data, style_embed_data, num_phonemes, x);
+        encoder->eval(src_seq_data, puncts_data, style_embed_data, num_phonemes, hidden_state);
 
-        decoder->eval(x, style_embed_data);
+        // run StyleTTS decoder
 
-        //struct ggml_tensor *x = ggml_graph_get_tensor(gf, "x");
-        //print_tensor("x", x, 6);
+        decoder->eval(hidden_state, style_embed_data, mel);
 
-        //struct ggml_tensor *x_punct = ggml_graph_get_tensor(gf, "x_punct");
-        //print_tensor("x_punct", x_punct, 11);
+        // run HifiGAN
 
-        // struct ggml_tensor *dbg2 = ggml_graph_get_tensor(gf, "dbg2");
-        // print_tensor("dbg2", dbg2, 11);
+        meldec->eval(mel, wav);
+    }
 
-        // print_tensor("y", y, 6);
-        // return true;
+    bool ZeroVOXModel::write_wav_file(const std::string &fname)
+    {
+
+        // // Function to generate a sine wave for testing
+        // std::vector<float> generateSineWave(double frequency, double duration, int sampleRate) {
+        //     std::vector<float> samples;
+        //     for (int i = 0; i < duration * sampleRate; ++i) {
+        //         double time = static_cast<double>(i) / sampleRate;
+        //         samples.push_back(static_cast<float>(sin(2.0 * M_PI * frequency * time)));
+        //     }
+        //     return samples;
+        // }
+
+        // --- Generate Sample Data (Sine Wave in this example) ---
+        //std::vector<float> audioData = generateSineWave(frequency, duration, sampleRate);
+
+        // --- libsndfile Setup ---
+        SF_INFO sfinfo;
+        sfinfo.samplerate = hparams.audio_sampling_rate;
+        sfinfo.channels   = 1;
+        sfinfo.format     = SF_FORMAT_WAV | SF_FORMAT_PCM_16;
+
+        // --- Open the WAV file for writing ---
+        SNDFILE* outfile = sf_open(fname.c_str(), SFM_WRITE, &sfinfo);
+
+        if (!outfile)
+        {
+            std::cerr << "Error opening " << fname << " : " << sf_strerror(NULL) << std::endl;
+            return false;
+        }
+
+        // --- Write the float data to the WAV file ---
+        sf_count_t num_frames = hparams.max_seq_len*hparams.audio_hop_size;
+        sf_count_t frames_written = sf_write_float(outfile, wav, num_frames);
+
+        if (frames_written != num_frames)
+        {
+            std::cerr << "Error writing to file " << fname << " .  Frames written: " << frames_written << " Expected: " << num_frames << std::endl;
+            std::cerr << "Error: " << sf_strerror(outfile) << std::endl; // Get error from the file object
+            sf_close(outfile);
+            return false;
+        }
+
+
+        // --- Close the file ---
+        if (sf_close(outfile) != 0)
+        {
+            std::cerr << "Error closing " << fname <<  " : " << sf_strerror(NULL) << std::endl;
+            return false;
+        }
+
+        std::cout << "Successfully created " << fname << " with " << frames_written << " samples." << std::endl;
+
+        return true;
     }
 }
+
+
 
 int main(void)
 {
@@ -336,6 +399,8 @@ int main(void)
     ZeroVOX::ZeroVOXModel model(g_gguf_filename);
 
     model.eval();
+
+    model.write_wav_file("foo.wav");
 
     return 0;
 }

@@ -621,11 +621,12 @@ namespace ZeroVOX
 
         for (uint32_t i=0; i<num_phonemes; i++)
         {
-            int32_t duration_runded = (int32_t) (exp(dur_data[i])-1.0+0.5);
+            float dur = exp(dur_data[i])-1.0;
+            int32_t duration_runded = (int32_t) (dur+0.5);
             if (duration_runded<0)
                 continue;
 
-            //printf("duration #%5d: %d\n", i, duration_runded);
+            //printf("duration #%5d: %10.3f -> %10.3f -> %d\n", i, dur_data[i], dur, duration_runded);
 
             // repeat feature duration_runded times
             for (int32_t r=0; r<duration_runded; r++)
